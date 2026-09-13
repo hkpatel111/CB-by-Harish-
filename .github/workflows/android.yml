@@ -1,4 +1,4 @@
-name: Cashbook Android Build - Auto Extract ZIP
+name: Cashbook Android Build - ZIP Extract + JVM17 Fix
 
 on:
   push:
@@ -31,7 +31,7 @@ jobs:
           shopt -s nullglob
           zips=( *.zip )
           if [ ${#zips[@]} -eq 0 ]; then
-            echo "Repository root में कोई ZIP नहीं मिली"
+            echo "Root में ZIP file नहीं मिली"
             exit 1
           fi
           zip_file="${zips[0]}"
@@ -39,36 +39,82 @@ jobs:
           rm -rf _source
           mkdir -p _source
           unzip -q -o "$zip_file" -d _source
-          echo "Extracted files:"
-          find _source -maxdepth 6 -type f | sort
 
-          # ZIP में root folder हो या direct files, दोनों cases संभालें
           project_dir=""
           while IFS= read -r settings; do
             candidate="$(dirname "$settings")"
-            if [ -f "$candidate/build.gradle.kts" ] || [ -f "$candidate/build.gradle" ]; then
-              if [ -d "$candidate/app" ]; then project_dir="$candidate"; break; fi
+            if { [ -f "$candidate/build.gradle.kts" ] || [ -f "$candidate/build.gradle" ]; } && [ -d "$candidate/app" ]; then
+              project_dir="$candidate"
+              break
             fi
           done < <(find _source -type f \( -name settings.gradle.kts -o -name settings.gradle \))
 
           if [ -z "$project_dir" ]; then
             echo "ZIP में valid Android Gradle project नहीं मिला"
-            echo "Expected: settings.gradle(.kts), build.gradle(.kts), app/"
+            find _source -maxdepth 8 -type f | sort
             exit 1
           fi
 
           echo "Project directory: $project_dir"
           cp -a "$project_dir"/. .
 
-      - name: Locate project after extraction
+      - name: Verify Android project
         shell: bash
         run: |
           set -euxo pipefail
-          find . -maxdepth 4 -type f -not -path './.git/*' | sort
           test -f settings.gradle.kts || test -f settings.gradle
           test -f build.gradle.kts || test -f build.gradle
           test -d app
           test -f app/build.gradle.kts || test -f app/build.gradle
+          find . -maxdepth 4 -type f -not -path './.git/*' | sort
+
+      - name: Fix JVM target compatibility to Java 17
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          f = Path("app/build.gradle.kts")
+          if not f.exists():
+              raise SystemExit("app/build.gradle.kts नहीं मिला")
+
+          text = f.read_text(encoding="utf-8")
+
+          compile_block = """
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+"""
+          if "sourceCompatibility = JavaVersion.VERSION_17" not in text:
+              marker = "    defaultConfig {"
+              if marker in text:
+                  text = text.replace(marker, compile_block + "
+" + marker, 1)
+              else:
+                  text += compile_block
+
+          if "jvmToolchain(17)" not in text:
+              text += """
+
+kotlin {
+    jvmToolchain(17)
+}
+"""
+
+          f.write_text(text, encoding="utf-8")
+
+          props = Path("gradle.properties")
+          old = props.read_text(encoding="utf-8") if props.exists() else ""
+          lines = [x for x in old.splitlines() if not x.startswith("kotlin.jvm.target.validation.mode=")]
+          lines.append("kotlin.jvm.target.validation.mode=error")
+          props.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+          echo "----- app/build.gradle.kts -----"
+          cat app/build.gradle.kts
+          echo "----- gradle.properties -----"
+          cat gradle.properties
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
@@ -111,7 +157,7 @@ jobs:
           cp -f build.log test.log diagnostics/ 2>/dev/null || true
           java -version > diagnostics/java-version.txt 2>&1 || true
           gradle --version > diagnostics/gradle-version.txt 2>&1 || true
-          find . -maxdepth 7 -type f -not -path './.git/*' | sort > diagnostics/repository-files.txt 2>&1 || true
+          find . -maxdepth 8 -type f -not -path './.git/*' | sort > diagnostics/repository-files.txt 2>&1 || true
           find app/build/outputs -type f -print > diagnostics/apk-output-files.txt 2>&1 || true
 
       - name: Upload APK
