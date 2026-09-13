@@ -1,10 +1,10 @@
-name: Cashbook Android Build
+name: Cashbook Android Build (self bootstrapping)
 
 on:
   push:
-    branches: [ "main", "master" ]
+    branches: ["main", "master"]
   pull_request:
-    branches: [ "main", "master" ]
+    branches: ["main", "master"]
   workflow_dispatch:
 
 permissions:
@@ -12,59 +12,77 @@ permissions:
 
 env:
   JAVA_VERSION: "17"
-  GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx2048m"
+  GRADLE_VERSION: "8.9"
+  ANDROID_API: "35"
+  BUILD_TOOLS: "35.0.0"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
-      - name: Checkout source
+      - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Show repository structure
+      - name: Locate Android project
+        shell: bash
         run: |
-          pwd
+          set -euxo pipefail
+          echo "Workspace: $GITHUB_WORKSPACE"
           find . -maxdepth 4 -type f | sort
+          test -f settings.gradle.kts || test -f settings.gradle || (echo "settings.gradle(.kts) नहीं मिला; ZIP की files repository root में extract करें"; exit 1)
+          test -f build.gradle.kts || test -f build.gradle || (echo "root build.gradle(.kts) नहीं मिला"; exit 1)
+          test -d app || (echo "app folder नहीं मिला"; exit 1)
+          test -f app/build.gradle.kts || test -f app/build.gradle || (echo "app/build.gradle(.kts) नहीं मिला"; exit 1)
 
       - name: Set up JDK 17
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: ${{ env.JAVA_VERSION }}
-          # Intentionally no cache: gradle here. It fails when Gradle wrapper files
-          # are absent. Caching is optional and can be added after wrapper is committed.
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
       - name: Install Android SDK packages
         run: |
+          set -euxo pipefail
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+          sdkmanager "platform-tools" "platforms;android-${ANDROID_API}" "build-tools;${BUILD_TOOLS}"
 
-      - name: Verify Gradle project
+      - name: Install Gradle directly
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Show tool versions
         run: |
-          test -f settings.gradle.kts
-          test -f build.gradle.kts
-          test -f app/build.gradle.kts
-          test -x ./gradlew || chmod +x ./gradlew
+          java -version
+          gradle --version
 
-      - name: Build debug APK
-        run: ./gradlew clean assembleDebug --no-daemon --stacktrace --info 2>&1 | tee build.log
+      - name: Build debug APK without wrapper
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle clean assembleDebug --no-daemon --stacktrace --info 2>&1 | tee build.log
 
       - name: Run tests if available
-        run: ./gradlew test --no-daemon --stacktrace 2>&1 | tee test.log
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle test --no-daemon --stacktrace 2>&1 | tee test.log
         continue-on-error: true
 
-      - name: Collect diagnostics
+      - name: Collect logs and diagnostics
         if: always()
+        shell: bash
         run: |
           mkdir -p diagnostics
           cp -f build.log test.log diagnostics/ 2>/dev/null || true
           java -version > diagnostics/java-version.txt 2>&1 || true
-          ./gradlew --version > diagnostics/gradle-version.txt 2>&1 || true
-          find app/build/outputs -type f -print > diagnostics/output-files.txt 2>&1 || true
+          gradle --version > diagnostics/gradle-version.txt 2>&1 || true
+          find . -maxdepth 5 -type f | sort > diagnostics/repository-files.txt 2>&1 || true
+          find app/build/outputs -type f -print > diagnostics/apk-output-files.txt 2>&1 || true
           find . -name '*.log' -not -path './.git/*' -exec cp --parents {} diagnostics/ \; 2>/dev/null || true
 
       - name: Upload APK
@@ -76,7 +94,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload logs and diagnostics
+      - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
