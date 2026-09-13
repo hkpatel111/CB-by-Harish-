@@ -1,10 +1,10 @@
-name: Cashbook Android Build - ZIP Extract and JVM17 Fix
+name: Cashbook Android Build - Robust
 
 on:
   push:
-    branches: ["main", "master"]
+    branches: [main, master]
   pull_request:
-    branches: ["main", "master"]
+    branches: [main, master]
   workflow_dispatch:
 
 permissions:
@@ -21,104 +21,75 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Find and extract source ZIP
+      - name: Extract source ZIP
         shell: bash
         run: |
-          set -euxo pipefail
-          shopt -s nullglob
-          zips=( *.zip )
-          if [ "${#zips[@]}" -eq 0 ]; then
-            echo "Root में ZIP file नहीं मिली"
+          set -euo pipefail
+          mkdir -p _source
+          zip_file=$(find . -maxdepth 1 -type f -name '*.zip' -print -quit)
+          if [ -z "$zip_file" ]; then
+            echo "No ZIP file found in repository root"
             exit 1
           fi
-
-          zip_file="${zips[0]}"
-          echo "Using ZIP: ${zip_file}"
-          rm -rf _source
-          mkdir -p _source
-          unzip -q -o "${zip_file}" -d _source
-
-          project_dir=""
-          while IFS= read -r settings; do
-            candidate="$(dirname "${settings}")"
-            if { [ -f "${candidate}/build.gradle.kts" ] || [ -f "${candidate}/build.gradle" ]; } && [ -d "${candidate}/app" ]; then
-              project_dir="${candidate}"
+          echo "Using ZIP: $zip_file"
+          unzip -q -o "$zip_file" -d _source
+          project_dir=$(find _source -type f \( -name settings.gradle.kts -o -name settings.gradle \) -print | while read -r file; do
+            dir=$(dirname "$file")
+            if { [ -f "$dir/build.gradle.kts" ] || [ -f "$dir/build.gradle" ]; } && [ -d "$dir/app" ]; then
+              echo "$dir"
               break
             fi
-          done < <(find _source -type f \( -name settings.gradle.kts -o -name settings.gradle \))
-
-          if [ -z "${project_dir}" ]; then
-            echo "ZIP में valid Android Gradle project नहीं मिला"
-            find _source -maxdepth 8 -type f | sort
+          done)
+          if [ -z "$project_dir" ]; then
+            echo "Valid Android project not found inside ZIP"
+            find _source -maxdepth 8 -type f -print | sort
             exit 1
           fi
+          echo "Project: $project_dir"
+          cp -a "$project_dir/." .
 
-          echo "Project directory: ${project_dir}"
-          cp -a "${project_dir}/." .
-
-      - name: Verify Android project
+      - name: Validate project
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           test -f settings.gradle.kts || test -f settings.gradle
           test -f build.gradle.kts || test -f build.gradle
           test -d app
           test -f app/build.gradle.kts || test -f app/build.gradle
-          find . -maxdepth 4 -type f -not -path './.git/*' | sort
+          echo "Android project detected"
 
-      - name: Fix JVM target compatibility to Java 17
+      - name: Apply JVM 17 settings
         shell: bash
         run: |
-          set -euxo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-
-          gradle_file = Path("app/build.gradle.kts")
-          if not gradle_file.exists():
-              raise SystemExit("app/build.gradle.kts नहीं मिला")
-
-          text = gradle_file.read_text(encoding="utf-8")
-
-          compile_block = """
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
-    }
-"""
-
-          if "sourceCompatibility = JavaVersion.VERSION_17" not in text:
-              marker = "    defaultConfig {"
-              if marker in text:
-                  text = text.replace(marker, compile_block + "\n" + marker, 1)
-              else:
-                  text += compile_block
-
-          if "jvmToolchain(17)" not in text:
-              text += """
+          set -euo pipefail
+          if [ ! -f app/build.gradle.kts ]; then
+            echo "This workflow expects app/build.gradle.kts"
+            exit 1
+          fi
+          if ! grep -q 'sourceCompatibility = JavaVersion.VERSION_17' app/build.gradle.kts; then
+            sed -i '/^[[:space:]]*defaultConfig[[:space:]]*{/i\    compileOptions {\n        sourceCompatibility = JavaVersion.VERSION_17\n        targetCompatibility = JavaVersion.VERSION_17\n    }\n' app/build.gradle.kts
+          fi
+          if ! grep -q 'jvmToolchain(17)' app/build.gradle.kts; then
+            printf '
 
 kotlin {
     jvmToolchain(17)
 }
-"""
+' >> app/build.gradle.kts
+          fi
+          touch gradle.properties
+          if ! grep -q '^kotlin.jvm.target.validation.mode=' gradle.properties; then
+            printf '
+kotlin.jvm.target.validation.mode=error
+' >> gradle.properties
+          fi
+          echo "JVM settings applied"
+          grep -n -A5 -B2 'compileOptions\|jvmToolchain' app/build.gradle.kts || true
 
-          gradle_file.write_text(text, encoding="utf-8")
-
-          properties_file = Path("gradle.properties")
-          old = properties_file.read_text(encoding="utf-8") if properties_file.exists() else ""
-          lines = [line for line in old.splitlines() if not line.startswith("kotlin.jvm.target.validation.mode=")]
-          lines.append("kotlin.jvm.target.validation.mode=error")
-          properties_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-          PY
-
-          echo "----- app/build.gradle.kts -----"
-          cat app/build.gradle.kts
-          echo "----- gradle.properties -----"
-          cat gradle.properties
-
-      - name: Set up JDK 17
+      - name: Set up Java
         uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -127,43 +98,42 @@ kotlin {
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install Android SDK packages
+      - name: Install SDK packages
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "platform-tools" "platforms;android-${ANDROID_API}" "build-tools;${BUILD_TOOLS}"
 
-      - name: Install Gradle
+      - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
         with:
-          gradle-version: "${GRADLE_VERSION}"
+          gradle-version: "8.9"
 
-      - name: Build debug APK
+      - name: Build APK
         shell: bash
         run: |
           set -o pipefail
           gradle clean assembleDebug --no-daemon --stacktrace --info 2>&1 | tee build.log
 
-      - name: Run tests if available
+      - name: Test
         shell: bash
         run: |
           set -o pipefail
           gradle test --no-daemon --stacktrace 2>&1 | tee test.log
         continue-on-error: true
 
-      - name: Collect diagnostics
+      - name: Prepare diagnostics
         if: always()
         shell: bash
         run: |
           mkdir -p diagnostics
-          cp -f build.log test.log diagnostics/ 2>/dev/null || true
+          cp -f build.log diagnostics/ 2>/dev/null || true
+          cp -f test.log diagnostics/ 2>/dev/null || true
           java -version > diagnostics/java-version.txt 2>&1 || true
           gradle --version > diagnostics/gradle-version.txt 2>&1 || true
-          find . -maxdepth 8 -type f -not -path './.git/*' | sort > diagnostics/repository-files.txt 2>&1 || true
-          if [ -d app/build/outputs ]; then
-            find app/build/outputs -type f -print > diagnostics/apk-output-files.txt 2>&1 || true
-          fi
+          find . -maxdepth 8 -type f -not -path './.git/*' -print | sort > diagnostics/files.txt || true
+          if [ -d app/build/outputs ]; then find app/build/outputs -type f -print > diagnostics/outputs.txt; fi
 
       - name: Upload APK
         if: success()
@@ -174,11 +144,12 @@ kotlin {
           if-no-files-found: error
           retention-days: 30
 
-      - name: Upload logs and diagnostics
+      - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: cashbook-build-logs-${{ github.run_number }}
-          path: diagnostics/
+          path: diagnostics
           if-no-files-found: warn
           retention-days: 30
+          
