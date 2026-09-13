@@ -1,4 +1,4 @@
-name: Cashbook Android Build - ZIP Extract + JVM17 Fix
+name: Cashbook Android Build - ZIP Extract and JVM17 Fix
 
 on:
   push:
@@ -30,33 +30,34 @@ jobs:
           set -euxo pipefail
           shopt -s nullglob
           zips=( *.zip )
-          if [ ${#zips[@]} -eq 0 ]; then
+          if [ "${#zips[@]}" -eq 0 ]; then
             echo "Root में ZIP file नहीं मिली"
             exit 1
           fi
+
           zip_file="${zips[0]}"
-          echo "Using ZIP: $zip_file"
+          echo "Using ZIP: ${zip_file}"
           rm -rf _source
           mkdir -p _source
-          unzip -q -o "$zip_file" -d _source
+          unzip -q -o "${zip_file}" -d _source
 
           project_dir=""
           while IFS= read -r settings; do
-            candidate="$(dirname "$settings")"
-            if { [ -f "$candidate/build.gradle.kts" ] || [ -f "$candidate/build.gradle" ]; } && [ -d "$candidate/app" ]; then
-              project_dir="$candidate"
+            candidate="$(dirname "${settings}")"
+            if { [ -f "${candidate}/build.gradle.kts" ] || [ -f "${candidate}/build.gradle" ]; } && [ -d "${candidate}/app" ]; then
+              project_dir="${candidate}"
               break
             fi
           done < <(find _source -type f \( -name settings.gradle.kts -o -name settings.gradle \))
 
-          if [ -z "$project_dir" ]; then
+          if [ -z "${project_dir}" ]; then
             echo "ZIP में valid Android Gradle project नहीं मिला"
             find _source -maxdepth 8 -type f | sort
             exit 1
           fi
 
-          echo "Project directory: $project_dir"
-          cp -a "$project_dir"/. .
+          echo "Project directory: ${project_dir}"
+          cp -a "${project_dir}/." .
 
       - name: Verify Android project
         shell: bash
@@ -75,11 +76,11 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          f = Path("app/build.gradle.kts")
-          if not f.exists():
+          gradle_file = Path("app/build.gradle.kts")
+          if not gradle_file.exists():
               raise SystemExit("app/build.gradle.kts नहीं मिला")
 
-          text = f.read_text(encoding="utf-8")
+          text = gradle_file.read_text(encoding="utf-8")
 
           compile_block = """
     compileOptions {
@@ -87,11 +88,11 @@ jobs:
         targetCompatibility = JavaVersion.VERSION_17
     }
 """
+
           if "sourceCompatibility = JavaVersion.VERSION_17" not in text:
               marker = "    defaultConfig {"
               if marker in text:
-                  text = text.replace(marker, compile_block + "
-" + marker, 1)
+                  text = text.replace(marker, compile_block + "\n" + marker, 1)
               else:
                   text += compile_block
 
@@ -103,14 +104,15 @@ kotlin {
 }
 """
 
-          f.write_text(text, encoding="utf-8")
+          gradle_file.write_text(text, encoding="utf-8")
 
-          props = Path("gradle.properties")
-          old = props.read_text(encoding="utf-8") if props.exists() else ""
-          lines = [x for x in old.splitlines() if not x.startswith("kotlin.jvm.target.validation.mode=")]
+          properties_file = Path("gradle.properties")
+          old = properties_file.read_text(encoding="utf-8") if properties_file.exists() else ""
+          lines = [line for line in old.splitlines() if not line.startswith("kotlin.jvm.target.validation.mode=")]
           lines.append("kotlin.jvm.target.validation.mode=error")
-          props.write_text("\n".join(lines) + "\n", encoding="utf-8")
+          properties_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
           PY
+
           echo "----- app/build.gradle.kts -----"
           cat app/build.gradle.kts
           echo "----- gradle.properties -----"
@@ -120,12 +122,13 @@ kotlin {
         uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
+          java-version: "17"
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
       - name: Install Android SDK packages
+        shell: bash
         run: |
           set -euxo pipefail
           yes | sdkmanager --licenses >/dev/null || true
@@ -134,7 +137,7 @@ kotlin {
       - name: Install Gradle
         uses: gradle/actions/setup-gradle@v6
         with:
-          gradle-version: ${{ env.GRADLE_VERSION }}
+          gradle-version: "${GRADLE_VERSION}"
 
       - name: Build debug APK
         shell: bash
@@ -158,7 +161,9 @@ kotlin {
           java -version > diagnostics/java-version.txt 2>&1 || true
           gradle --version > diagnostics/gradle-version.txt 2>&1 || true
           find . -maxdepth 8 -type f -not -path './.git/*' | sort > diagnostics/repository-files.txt 2>&1 || true
-          find app/build/outputs -type f -print > diagnostics/apk-output-files.txt 2>&1 || true
+          if [ -d app/build/outputs ]; then
+            find app/build/outputs -type f -print > diagnostics/apk-output-files.txt 2>&1 || true
+          fi
 
       - name: Upload APK
         if: success()
@@ -177,4 +182,3 @@ kotlin {
           path: diagnostics/
           if-no-files-found: warn
           retention-days: 30
-          
