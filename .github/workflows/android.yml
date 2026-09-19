@@ -1,12 +1,8 @@
 name: Build Expo Standalone APK
 
-# Source ZIP at repo root (Expo / React Native).
-# Builds a sideloadable APK with JS bundle embedded (no Metro required).
-#
-# Strategy:
-#   1. expo prebuild → android/
-#   2. Explicitly bundle JS into android/app/src/main/assets/index.android.bundle
-#   3. assembleDebug (debug keystore, installs easily; bundle already in assets)
+# Expo / React Native ZIP at repo root → standalone APK (JS embedded, no Metro).
+# Uses assembleRelease so the React Native Gradle plugin bundles JS automatically.
+# Signed with a generated debug keystore (sideload OK; not for Play Store).
 
 on:
   push:
@@ -101,7 +97,6 @@ jobs:
           pkg.dependencies = strip(pkg.dependencies);
           pkg.devDependencies = strip(pkg.devDependencies);
           delete pkg.packageManager;
-          pkg.scripts = pkg.scripts || {};
           fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
           NODE
 
@@ -117,7 +112,7 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Install Android SDK (no obsolete tools package)
+      - name: Install Android SDK
         run: |
           set -e
           mkdir -p "$ANDROID_HOME/cmdline-tools"
@@ -172,52 +167,48 @@ jobs:
           NODE
           pnpm install --no-frozen-lockfile || npm install
 
-      # Embed JS so the APK does not need Metro (fixes red "Unable to load script" screen)
-      - name: Bundle JS into android assets
-        working-directory: ${{ env.PROJECT_DIR }}
+      - name: Create debug keystore for release signing
+        working-directory: ${{ env.PROJECT_DIR }}/android
         run: |
           set -e
-          mkdir -p android/app/src/main/assets
+          # Sideload-only keystore (NOT for Play Store)
+          keytool -genkeypair -v \
+            -storetype PKCS12 \
+            -keystore debug-release.keystore \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+          ls -la debug-release.keystore
 
-          ENTRY=$(node -e "const p=require('./package.json'); console.log(p.main || 'node_modules/expo/AppEntry.js')")
-          echo "Entry file: $ENTRY"
-
-          # Prefer expo export pipeline when available; fall back to react-native CLI bundle
-          if npx expo export --help 2>&1 | grep -q -- '--platform'; then
-            echo "Trying expo export for android assets..."
-            # Still use classic bundle for assets path that RN debug loads
-            true
-          fi
-
-          npx react-native bundle \
-            --platform android \
-            --dev false \
-            --minify true \
-            --entry-file "$ENTRY" \
-            --bundle-output android/app/src/main/assets/index.android.bundle \
-            --assets-dest android/app/src/main/res \
-            --reset-cache
-
-          ls -la android/app/src/main/assets/
-          # Sanity: bundle must not be empty
-          test -s android/app/src/main/assets/index.android.bundle
-
-      - name: Build debug APK (with embedded bundle)
+      - name: Build RELEASE APK (Gradle embeds JS bundle automatically)
         working-directory: ${{ env.PROJECT_DIR }}/android
         run: |
           set -e
           chmod +x gradlew
-          ./gradlew assembleDebug --stacktrace --no-daemon 2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
+
+          # Injected signing avoids editing build.gradle and works with AGP
+          ./gradlew assembleRelease \
+            -Pandroid.injected.signing.store.file="$(pwd)/debug-release.keystore" \
+            -Pandroid.injected.signing.store.password=android \
+            -Pandroid.injected.signing.key.alias=androiddebugkey \
+            -Pandroid.injected.signing.key.password=android \
+            --stacktrace --no-daemon \
+            2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
+
           echo "== APK files =="
           find . -name "*.apk" -type f -print
 
-      - name: Upload APK
+      - name: Upload standalone APK
         uses: actions/upload-artifact@v4
         with:
           name: gram-panchayat-cashbook-standalone-apk
           path: |
-            ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/debug/*.apk
-            ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/**/*.apk
+            ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/release/*.apk
+            ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/**/*-release*.apk
           if-no-files-found: error
           retention-days: 14
 
