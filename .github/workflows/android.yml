@@ -1,8 +1,8 @@
-name: Build Expo Debug APK
+name: Build Expo Standalone APK
 
 # Source ZIP: Gram-Panchayat-Cashbook-Android-MVP.zip (Expo / React Native)
-# Flow: extract → sanitize package.json → pnpm install → expo prebuild --no-install
-#       → re-install if needed → gradle assembleDebug
+# Produces a RELEASE APK with JS bundle embedded (works offline, no Metro).
+# Release is signed with the Android debug keystore so it installs without a custom keystore.
 
 on:
   push:
@@ -159,16 +159,13 @@ jobs:
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
-          # --no-install: do not prompt to install updated deps after rewriting package.json
-          # CI=1 already set in job env
           npx expo prebuild --platform android --clean --no-install
           ls -la android
 
-      - name: Re-install deps after prebuild (package.json may have changed)
+      - name: Re-install deps after prebuild
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
-          # Strip monorepo markers again if prebuild rewrote package.json
           node <<'NODE'
           const fs = require('fs');
           const pkgPath = 'package.json';
@@ -195,21 +192,90 @@ jobs:
             pnpm install || npm install
           fi
 
-      - name: Build debug APK with Gradle
+      # Critical: debug APK does NOT embed JS (expects Metro).
+      # Release APK embeds index.android.bundle. Sign release with debug keystore
+      # so the APK installs on any device without a custom upload keystore.
+      - name: Force release buildType to use debug signing
+        working-directory: ${{ env.PROJECT_DIR }}/android
+        run: |
+          set -e
+          APP_GRADLE="app/build.gradle"
+          if [ ! -f "$APP_GRADLE" ]; then
+            APP_GRADLE="app/build.gradle.kts"
+          fi
+          echo "Patching $APP_GRADLE for debug-signed release..."
+
+          if [ -f app/build.gradle ]; then
+            # Groovy: ensure release uses signingConfigs.debug
+            python3 - <<'PY'
+          from pathlib import Path
+          p = Path("app/build.gradle")
+          text = p.read_text()
+          if "signingConfig signingConfigs.debug" in text and "release" in text:
+              # Already may reference debug in places; force inside release block
+              import re
+              def fix_release(m):
+                  block = m.group(0)
+                  if "signingConfig" in block:
+                      block = re.sub(r"signingConfig\s+[^\n]+", "signingConfig signingConfigs.debug", block)
+                  else:
+                      block = block.replace("{", "{\n            signingConfig signingConfigs.debug", 1)
+                  return block
+              text2 = re.sub(
+                  r"release\s*\{[^}]*\}",
+                  fix_release,
+                  text,
+                  count=1,
+                  flags=re.DOTALL,
+              )
+              p.write_text(text2)
+              print("Patched Groovy release signingConfig -> debug")
+          else:
+              print("app/build.gradle not found, skip groovy patch")
+          PY
+          elif [ -f app/build.gradle.kts ]; then
+            python3 - <<'PY'
+          from pathlib import Path
+          import re
+          p = Path("app/build.gradle.kts")
+          text = p.read_text()
+          # Kotlin DSL: signingConfig = signingConfigs.getByName("debug")
+          def fix_release(m):
+              block = m.group(0)
+              if "signingConfig" in block:
+                  block = re.sub(
+                      r"signingConfig\s*=\s*[^\n]+",
+                      'signingConfig = signingConfigs.getByName("debug")',
+                      block,
+                  )
+              else:
+                  block = block.replace("{", '{\n            signingConfig = signingConfigs.getByName("debug")', 1)
+              return block
+          text2 = re.sub(r"release\s*\{[^}]*\}", fix_release, text, count=1, flags=re.DOTALL)
+          p.write_text(text2)
+          print("Patched Kotlin release signingConfig -> debug")
+          PY
+          else
+            echo "WARNING: could not find app/build.gradle(.kts) to patch signing"
+            ls -la app/ || true
+          fi
+
+      - name: Build RELEASE APK (embeds JS bundle — no Metro needed)
         working-directory: ${{ env.PROJECT_DIR }}/android
         run: |
           set -e
           chmod +x gradlew
-          ./gradlew assembleDebug --stacktrace --no-daemon
+          # Release packages index.android.bundle into the APK
+          ./gradlew assembleRelease --stacktrace --no-daemon
           echo "== APK search =="
           find . -name "*.apk" -type f
 
-      - name: Upload debug APK
+      - name: Upload standalone APK
         uses: actions/upload-artifact@v4
         with:
-          name: gram-panchayat-cashbook-debug-apk
+          name: gram-panchayat-cashbook-standalone-apk
           path: |
-            ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/debug/*.apk
+            ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/release/*.apk
             ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
           retention-days: 14
