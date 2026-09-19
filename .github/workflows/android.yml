@@ -73,30 +73,60 @@ jobs:
           corepack prepare pnpm@9.15.0 --activate
           pnpm --version
 
-      - name: Sanitize package.json (strip monorepo-only deps)
+      # Critical: Replit monorepo used "catalog:" / "workspace:*" versions.
+      # Removing catalog packages broke the bundle (@tanstack/react-query is imported).
+      # Replace catalog: with real npm versions; only drop internal @workspace/* packages.
+      - name: Sanitize package.json for standalone CI
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
           node <<'NODE'
           const fs = require('fs');
           const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-          const strip = (deps) => {
+
+          // Known catalog: pins used by this project (add more if bundle reports missing modules)
+          const CATALOG = {
+            '@tanstack/react-query': '^5.62.8',
+            'zod': '^3.24.1',
+          };
+
+          function fixDeps(deps, label) {
             if (!deps) return deps;
             const out = {};
             for (const [name, ver] of Object.entries(deps)) {
               if (typeof ver !== 'string') continue;
-              if (ver.startsWith('workspace:') || ver.startsWith('catalog:')) {
-                console.log('Removing:', name, ver);
+
+              // Internal monorepo package — not published; drop (app source does not import it)
+              if (ver.startsWith('workspace:') || name.startsWith('@workspace/')) {
+                console.log(`[${label}] drop workspace package: ${name}@${ver}`);
                 continue;
               }
+
+              if (ver === 'catalog:' || ver.startsWith('catalog:')) {
+                const pinned = CATALOG[name];
+                if (!pinned) {
+                  console.log(`[${label}] WARNING: no pin for catalog package ${name}, using latest`);
+                  out[name] = 'latest';
+                } else {
+                  console.log(`[${label}] catalog ${name} -> ${pinned}`);
+                  out[name] = pinned;
+                }
+                continue;
+              }
+
               out[name] = ver;
             }
             return out;
-          };
-          pkg.dependencies = strip(pkg.dependencies);
-          pkg.devDependencies = strip(pkg.devDependencies);
+          }
+
+          pkg.dependencies = fixDeps(pkg.dependencies, 'dependencies');
+          pkg.devDependencies = fixDeps(pkg.devDependencies, 'devDependencies');
           delete pkg.packageManager;
+
+          // Ensure react-query is present even if only listed under devDependencies
+          // (Metro resolves from node_modules either way after install)
           fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          console.log('Sanitized package.json written');
           NODE
 
       - name: Install JS dependencies
@@ -104,6 +134,8 @@ jobs:
         run: |
           set -e
           pnpm install --no-frozen-lockfile || npm install
+          # Prove critical module is resolvable before native build
+          node -e "require.resolve('@tanstack/react-query'); console.log('react-query OK')"
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -143,28 +175,37 @@ jobs:
           npx expo prebuild --platform android --clean --no-install
           ls -la android
 
-      - name: Re-install deps after prebuild
+      - name: Re-sanitize + re-install after prebuild
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
           node <<'NODE'
           const fs = require('fs');
           const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-          const strip = (deps) => {
+          const CATALOG = {
+            '@tanstack/react-query': '^5.62.8',
+            'zod': '^3.24.1',
+          };
+          function fixDeps(deps) {
             if (!deps) return deps;
             const out = {};
             for (const [name, ver] of Object.entries(deps)) {
               if (typeof ver !== 'string') continue;
-              if (ver.startsWith('workspace:') || ver.startsWith('catalog:')) continue;
+              if (ver.startsWith('workspace:') || name.startsWith('@workspace/')) continue;
+              if (ver === 'catalog:' || ver.startsWith('catalog:')) {
+                out[name] = CATALOG[name] || 'latest';
+                continue;
+              }
               out[name] = ver;
             }
             return out;
-          };
-          pkg.dependencies = strip(pkg.dependencies);
-          pkg.devDependencies = strip(pkg.devDependencies);
+          }
+          pkg.dependencies = fixDeps(pkg.dependencies);
+          pkg.devDependencies = fixDeps(pkg.devDependencies);
           fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
           NODE
           pnpm install --no-frozen-lockfile || npm install
+          node -e "require.resolve('@tanstack/react-query'); console.log('react-query OK after prebuild')"
 
       - name: Create debug keystore for release signing
         working-directory: ${{ env.PROJECT_DIR }}/android
@@ -180,12 +221,10 @@ jobs:
             -keysize 2048 \
             -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US"
-          ls -la debug-release.keystore
 
       - name: Build RELEASE APK
         working-directory: ${{ env.PROJECT_DIR }}/android
         run: |
-          # pipefail: if gradlew fails, the step fails (tee alone always exits 0)
           set -eo pipefail
           chmod +x gradlew
 
@@ -197,7 +236,7 @@ jobs:
             --stacktrace --no-daemon \
             2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
 
-          echo "== All APK files under android/ =="
+          echo "== All APK files =="
           find . -name "*.apk" -type f -print || true
 
       - name: Locate APK and copy to known path
@@ -206,16 +245,14 @@ jobs:
           set -e
           mkdir -p "$GITHUB_WORKSPACE/apk-out"
 
-          # Prefer signed release, then any release, then any apk
           APK=$(find . -path "*/outputs/apk/*" -name "*.apk" -type f | grep -E 'release' | head -n 1 || true)
           if [ -z "$APK" ]; then
             APK=$(find . -name "*.apk" -type f | head -n 1 || true)
           fi
 
           if [ -z "$APK" ]; then
-            echo "ERROR: No APK produced. Last 80 lines of gradle log:"
-            tail -n 80 "$GITHUB_WORKSPACE/gradle-build.log" || true
-            echo "---- tree outputs ----"
+            echo "ERROR: No APK produced. Tail of gradle log:"
+            tail -n 100 "$GITHUB_WORKSPACE/gradle-build.log" || true
             find . -path "*/build/outputs/*" -type f | head -80 || true
             exit 1
           fi
@@ -240,7 +277,6 @@ jobs:
           path: |
             ${{ github.workspace }}/gradle-build.log
             ${{ env.PROJECT_DIR }}/android/**/build/reports/**
-            ${{ env.PROJECT_DIR }}/android/**/build/outputs/**
           retention-days: 7
           if-no-files-found: ignore
           
