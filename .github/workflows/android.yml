@@ -1,24 +1,173 @@
-kind = "mobile"
-previewPath = "/"
-title = "Gram Panchayat Cashbook"
-description = "An offline-first Android cashbook for gram panchayat finance teams. Tracks income, expenses, dynamic fund balances, 30-line cashbook pages, and financial-year summaries with a clear Hindi-first workflow."
-version = "1.0.0"
-id = "artifacts/cashbook-mobile"
-router = "expo-domain"
+name: Build Expo Debug APK
 
-[[services]]
-name = "expo"
-ensurePreviewReachable = "/status"
-paths = [ "/" ]
-localPort = 26049
+# Source ZIP: Gram-Panchayat-Cashbook-Android-MVP.zip (Expo / React Native)
+# Produces a debug APK via: extract → pnpm install → expo prebuild → gradle assembleDebug
 
-[services.development]
-run = "pnpm --filter @workspace/cashbook-mobile run dev"
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
 
-[services.production]
-build = [ "pnpm", "--filter", "@workspace/cashbook-mobile", "run", "build" ]
-run = [ "pnpm", "--filter", "@workspace/cashbook-mobile", "run", "serve" ]
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
 
-[services.env]
-PORT = "26049"
-BASE_PATH = "/"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find and extract source ZIP
+        run: |
+          set -e
+          echo "== Repository root =="
+          ls -la
+
+          ZIP=$(find . -maxdepth 1 -type f \( \
+            -iname '*Gram-Panchayat*.zip' -o \
+            -iname '*cashbook*.zip' -o \
+            -iname '*source*.zip' -o \
+            -iname '*MVP*.zip' \
+          \) | head -n 1)
+
+          if [ -z "$ZIP" ]; then
+            echo "ERROR: No source ZIP found in repository root."
+            exit 1
+          fi
+          echo "Found ZIP: $ZIP"
+
+          mkdir -p extracted
+          unzip -o "$ZIP" -d extracted
+
+          # Detect project root (cashbook-mobile/ or root with package.json + app.json)
+          if [ -f extracted/cashbook-mobile/package.json ]; then
+            PROJECT_DIR=extracted/cashbook-mobile
+          elif [ -f extracted/package.json ] && [ -f extracted/app.json ]; then
+            PROJECT_DIR=extracted
+          else
+            PROJECT_DIR=$(find extracted -type f -name 'package.json' -printf '%h\n' | head -n 1)
+          fi
+
+          if [ -z "$PROJECT_DIR" ] || [ ! -f "$PROJECT_DIR/package.json" ]; then
+            echo "ERROR: Could not locate Expo project (package.json)."
+            find extracted -type f | head -60
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          ls -la "$PROJECT_DIR"
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Enable corepack / pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@9.15.0 --activate
+          pnpm --version
+
+      - name: Make package.json CI-friendly (strip monorepo-only deps)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -e
+          node <<'NODE'
+          const fs = require('fs');
+          const pkgPath = 'package.json';
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+
+          // This ZIP was built for a Replit/pnpm workspace.
+          // Outside the monorepo, workspace:* and catalog: cannot resolve.
+          const strip = (deps) => {
+            if (!deps) return deps;
+            const out = {};
+            for (const [name, ver] of Object.entries(deps)) {
+              if (typeof ver !== 'string') continue;
+              if (ver.startsWith('workspace:') || ver.startsWith('catalog:')) {
+                console.log(`Removing monorepo-only dep: ${name}@${ver}`);
+                continue;
+              }
+              out[name] = ver;
+            }
+            return out;
+          };
+
+          pkg.dependencies = strip(pkg.dependencies);
+          pkg.devDependencies = strip(pkg.devDependencies);
+          delete pkg.packageManager;
+
+          pkg.scripts = pkg.scripts || {};
+          if (!pkg.scripts['android']) {
+            pkg.scripts['android'] = 'expo run:android';
+          }
+
+          fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+          console.log('package.json sanitized for standalone CI install');
+          NODE
+
+      - name: Install dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -e
+          if [ -f pnpm-lock.yaml ]; then
+            pnpm install --no-frozen-lockfile || npm install
+          else
+            pnpm install || npm install
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android licenses
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+
+      - name: Expo prebuild (generate android/ native project)
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          CI: 'true'
+          EXPO_NO_TELEMETRY: '1'
+        run: |
+          set -e
+          npx expo prebuild --platform android --non-interactive --clean
+          ls -la android || ls -la .
+
+      - name: Build debug APK with Gradle
+        working-directory: ${{ env.PROJECT_DIR }}/android
+        env:
+          CI: 'true'
+        run: |
+          set -e
+          chmod +x gradlew
+          ./gradlew assembleDebug --stacktrace --no-daemon
+          echo "== APK search =="
+          find . -name "*.apk" -type f
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: gram-panchayat-cashbook-debug-apk
+          path: |
+            ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/debug/*.apk
+            ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/**/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: expo-build-logs
+          path: |
+            ${{ env.PROJECT_DIR }}/**/build/reports/**
+            ${{ env.PROJECT_DIR }}/android/**/build/outputs/**
+          retention-days: 7
+          if-no-files-found: ignore
