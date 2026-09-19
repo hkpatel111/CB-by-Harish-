@@ -1,155 +1,113 @@
-name: Cashbook Android Build - Robust
+name: Build Debug APK
 
 on:
   push:
-    branches: [main, master]
-  pull_request:
-    branches: [main, master]
+    branches: [ main, master ]
   workflow_dispatch:
-
-permissions:
-  contents: read
-
-env:
-  JAVA_VERSION: "17"
-  GRADLE_VERSION: "8.9"
-  ANDROID_API: "35"
-  BUILD_TOOLS: "35.0.0"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Extract source ZIP
-        shell: bash
+      - name: Find and extract source ZIP
         run: |
-          set -euo pipefail
-          mkdir -p _source
-          zip_file=$(find . -maxdepth 1 -type f -name '*.zip' -print -quit)
-          if [ -z "$zip_file" ]; then
-            echo "No ZIP file found in repository root"
+          set -e
+          echo "Looking for source ZIP in repository root..."
+          ls -la
+
+          ZIP=$(find . -maxdepth 1 -type f \( -iname '*cashbook*.zip' -o -iname '*source*.zip' \) | head -n 1)
+          if [ -z "$ZIP" ]; then
+            echo "ERROR: No Cashbook/source ZIP found in repository root."
             exit 1
           fi
-          echo "Using ZIP: $zip_file"
-          unzip -q -o "$zip_file" -d _source
-          project_dir=$(find _source -type f \( -name settings.gradle.kts -o -name settings.gradle \) -print | while read -r file; do
-            dir=$(dirname "$file")
-            if { [ -f "$dir/build.gradle.kts" ] || [ -f "$dir/build.gradle" ]; } && [ -d "$dir/app" ]; then
-              echo "$dir"
-              break
-            fi
-          done)
-          if [ -z "$project_dir" ]; then
-            echo "Valid Android project not found inside ZIP"
-            find _source -maxdepth 8 -type f -print | sort
+          echo "Found ZIP: $ZIP"
+
+          mkdir -p extracted
+          unzip -o "$ZIP" -d extracted
+          echo "Extracted contents:"
+          find extracted -maxdepth 3 -type d | head -40
+
+          # Project root may be extracted/CashbookApp or extracted/ itself
+          if [ -f extracted/settings.gradle.kts ] || [ -f extracted/settings.gradle ]; then
+            PROJECT_DIR=extracted
+          elif [ -f extracted/CashbookApp/settings.gradle.kts ] || [ -f extracted/CashbookApp/settings.gradle ]; then
+            PROJECT_DIR=extracted/CashbookApp
+          else
+            # Fallback: first folder that contains settings.gradle*
+            PROJECT_DIR=$(find extracted -type f \( -name 'settings.gradle.kts' -o -name 'settings.gradle' \) -printf '%h\n' | head -n 1)
+          fi
+
+          if [ -z "$PROJECT_DIR" ] || [ ! -d "$PROJECT_DIR" ]; then
+            echo "ERROR: Could not locate Android project root after extraction."
+            find extracted -type f | head -50
             exit 1
           fi
-          echo "Project: $project_dir"
-          cp -a "$project_dir/." .
 
-      - name: Validate project
-        shell: bash
-        run: |
-          set -euo pipefail
-          test -f settings.gradle.kts || test -f settings.gradle
-          test -f build.gradle.kts || test -f build.gradle
-          test -d app
-          test -f app/build.gradle.kts || test -f app/build.gradle
-          echo "Android project detected"
+          echo "PROJECT_DIR=$PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          ls -la "$PROJECT_DIR"
 
-      - name: Apply JVM 17 settings
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ ! -f app/build.gradle.kts ]; then
-            echo "This workflow expects app/build.gradle.kts"
-            exit 1
-          fi
-          if ! grep -q 'sourceCompatibility = JavaVersion.VERSION_17' app/build.gradle.kts; then
-            sed -i '/^[[:space:]]*defaultConfig[[:space:]]*{/i\    compileOptions {\n        sourceCompatibility = JavaVersion.VERSION_17\n        targetCompatibility = JavaVersion.VERSION_17\n    }\n' app/build.gradle.kts
-          fi
-          if ! grep -q 'jvmToolchain(17)' app/build.gradle.kts; then
-            printf '
-
-kotlin {
-    jvmToolchain(17)
-}
-' >> app/build.gradle.kts
-          fi
-          touch gradle.properties
-          if ! grep -q '^kotlin.jvm.target.validation.mode=' gradle.properties; then
-            printf '
-kotlin.jvm.target.validation.mode=error
-' >> gradle.properties
-          fi
-          echo "JVM settings applied"
-          grep -n -A5 -B2 'compileOptions\|jvmToolchain' app/build.gradle.kts || true
-
-      - name: Set up Java
-        uses: actions/setup-java@v5
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: '17'
+          # Do NOT enable gradle cache here — wrapper jar is not committed (see README)
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v4
-
-      - name: Install SDK packages
-        shell: bash
+      - name: Grant execute permission for gradlew (if present)
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          set -euo pipefail
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platform-tools" "platforms;android-${ANDROID_API}" "build-tools;${BUILD_TOOLS}"
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+          else
+            echo "No gradlew yet — will generate wrapper after Gradle is available."
+          fi
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v6
+        uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: "8.9"
+          # Generate wrapper if missing; project only ships gradle-wrapper.properties
+          cache-disabled: true
 
-      - name: Build APK
-        shell: bash
+      - name: Ensure Gradle wrapper exists
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          set -o pipefail
-          gradle clean assembleDebug --no-daemon --stacktrace --info 2>&1 | tee build.log
+          set -e
+          if [ ! -f gradlew ]; then
+            echo "Generating Gradle wrapper (gradle-wrapper.jar was not in the ZIP)..."
+            gradle wrapper --gradle-version 8.7
+          fi
+          chmod +x gradlew
+          ./gradlew --version
 
-      - name: Test
-        shell: bash
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
-          set -o pipefail
-          gradle test --no-daemon --stacktrace 2>&1 | tee test.log
-        continue-on-error: true
+          set -e
+          ./gradlew assembleDebug --stacktrace --no-daemon
+          echo "Build finished. Looking for APK..."
+          find . -name "*.apk" -type f
 
-      - name: Prepare diagnostics
-        if: always()
-        shell: bash
-        run: |
-          mkdir -p diagnostics
-          cp -f build.log diagnostics/ 2>/dev/null || true
-          cp -f test.log diagnostics/ 2>/dev/null || true
-          java -version > diagnostics/java-version.txt 2>&1 || true
-          gradle --version > diagnostics/gradle-version.txt 2>&1 || true
-          find . -maxdepth 8 -type f -not -path './.git/*' -print | sort > diagnostics/files.txt || true
-          if [ -d app/build/outputs ]; then find app/build/outputs -type f -print > diagnostics/outputs.txt; fi
-
-      - name: Upload APK
-        if: success()
+      - name: Upload debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: cashbook-debug-apk-${{ github.run_number }}
-          path: app/build/outputs/apk/debug/*.apk
+          name: cashbook-debug-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 14
 
-      - name: Upload diagnostics
-        if: always()
+      - name: Upload build logs on failure
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: cashbook-build-logs-${{ github.run_number }}
-          path: diagnostics
-          if-no-files-found: warn
-          retention-days: 30
-          
+          name: build-logs
+          path: |
+            ${{ env.PROJECT_DIR }}/**/build/reports/**
+            ${{ env.PROJECT_DIR }}/**/build/outputs/**
+          retention-days: 7
+          if-no-files-found: ignore
