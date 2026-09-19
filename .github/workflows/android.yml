@@ -1,8 +1,12 @@
 name: Build Expo Standalone APK
 
-# Source ZIP: Gram-Panchayat-Cashbook-Android-MVP.zip (Expo / React Native)
-# Produces a RELEASE APK with JS bundle embedded (works offline, no Metro).
-# Release is signed with the Android debug keystore so it installs without a custom keystore.
+# Source ZIP at repo root (Expo / React Native).
+# Builds a sideloadable APK with JS bundle embedded (no Metro required).
+#
+# Strategy:
+#   1. expo prebuild → android/
+#   2. Explicitly bundle JS into android/app/src/main/assets/index.android.bundle
+#   3. assembleDebug (debug keystore, installs easily; bundle already in assets)
 
 on:
   push:
@@ -12,7 +16,7 @@ on:
 jobs:
   build-apk:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
 
     env:
       ANDROID_HOME: ${{ github.workspace }}/android-sdk
@@ -27,7 +31,6 @@ jobs:
       - name: Find and extract source ZIP
         run: |
           set -e
-          echo "== Repository root =="
           ls -la
 
           ZIP=$(find . -maxdepth 1 -type f \( \
@@ -75,51 +78,38 @@ jobs:
           corepack prepare pnpm@9.15.0 --activate
           pnpm --version
 
-      - name: Make package.json CI-friendly (strip monorepo-only deps)
+      - name: Sanitize package.json (strip monorepo-only deps)
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
           node <<'NODE'
           const fs = require('fs');
-          const pkgPath = 'package.json';
-          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
           const strip = (deps) => {
             if (!deps) return deps;
             const out = {};
             for (const [name, ver] of Object.entries(deps)) {
               if (typeof ver !== 'string') continue;
               if (ver.startsWith('workspace:') || ver.startsWith('catalog:')) {
-                console.log(`Removing monorepo-only dep: ${name}@${ver}`);
+                console.log('Removing:', name, ver);
                 continue;
               }
               out[name] = ver;
             }
             return out;
           };
-
           pkg.dependencies = strip(pkg.dependencies);
           pkg.devDependencies = strip(pkg.devDependencies);
           delete pkg.packageManager;
-
           pkg.scripts = pkg.scripts || {};
-          if (!pkg.scripts['android']) {
-            pkg.scripts['android'] = 'expo run:android';
-          }
-
-          fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
-          console.log('package.json sanitized for standalone CI install');
+          fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
           NODE
 
       - name: Install JS dependencies
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
-          if [ -f pnpm-lock.yaml ]; then
-            pnpm install --no-frozen-lockfile || npm install
-          else
-            pnpm install || npm install
-          fi
+          pnpm install --no-frozen-lockfile || npm install
 
       - name: Set up JDK 17
         uses: actions/setup-java@v4
@@ -127,7 +117,7 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Install Android command-line tools + SDK packages
+      - name: Install Android SDK (no obsolete tools package)
         run: |
           set -e
           mkdir -p "$ANDROID_HOME/cmdline-tools"
@@ -141,7 +131,6 @@ jobs:
           rm -rf cmdline-tools cmdline-tools.zip
 
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
-
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager --install \
             "platform-tools" \
@@ -153,9 +142,7 @@ jobs:
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
 
-          sdkmanager --list_installed | head -30
-
-      - name: Expo prebuild (generate android/ — no interactive install)
+      - name: Expo prebuild
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
@@ -168,9 +155,7 @@ jobs:
           set -e
           node <<'NODE'
           const fs = require('fs');
-          const pkgPath = 'package.json';
-          if (!fs.existsSync(pkgPath)) process.exit(0);
-          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
           const strip = (deps) => {
             if (!deps) return deps;
             const out = {};
@@ -183,111 +168,67 @@ jobs:
           };
           pkg.dependencies = strip(pkg.dependencies);
           pkg.devDependencies = strip(pkg.devDependencies);
-          fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+          fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
           NODE
+          pnpm install --no-frozen-lockfile || npm install
 
-          if [ -f pnpm-lock.yaml ]; then
-            pnpm install --no-frozen-lockfile || npm install
-          else
-            pnpm install || npm install
-          fi
-
-      # Critical: debug APK does NOT embed JS (expects Metro).
-      # Release APK embeds index.android.bundle. Sign release with debug keystore
-      # so the APK installs on any device without a custom upload keystore.
-      - name: Force release buildType to use debug signing
-        working-directory: ${{ env.PROJECT_DIR }}/android
+      # Embed JS so the APK does not need Metro (fixes red "Unable to load script" screen)
+      - name: Bundle JS into android assets
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
-          APP_GRADLE="app/build.gradle"
-          if [ ! -f "$APP_GRADLE" ]; then
-            APP_GRADLE="app/build.gradle.kts"
-          fi
-          echo "Patching $APP_GRADLE for debug-signed release..."
+          mkdir -p android/app/src/main/assets
 
-          if [ -f app/build.gradle ]; then
-            # Groovy: ensure release uses signingConfigs.debug
-            python3 - <<'PY'
-          from pathlib import Path
-          p = Path("app/build.gradle")
-          text = p.read_text()
-          if "signingConfig signingConfigs.debug" in text and "release" in text:
-              # Already may reference debug in places; force inside release block
-              import re
-              def fix_release(m):
-                  block = m.group(0)
-                  if "signingConfig" in block:
-                      block = re.sub(r"signingConfig\s+[^\n]+", "signingConfig signingConfigs.debug", block)
-                  else:
-                      block = block.replace("{", "{\n            signingConfig signingConfigs.debug", 1)
-                  return block
-              text2 = re.sub(
-                  r"release\s*\{[^}]*\}",
-                  fix_release,
-                  text,
-                  count=1,
-                  flags=re.DOTALL,
-              )
-              p.write_text(text2)
-              print("Patched Groovy release signingConfig -> debug")
-          else:
-              print("app/build.gradle not found, skip groovy patch")
-          PY
-          elif [ -f app/build.gradle.kts ]; then
-            python3 - <<'PY'
-          from pathlib import Path
-          import re
-          p = Path("app/build.gradle.kts")
-          text = p.read_text()
-          # Kotlin DSL: signingConfig = signingConfigs.getByName("debug")
-          def fix_release(m):
-              block = m.group(0)
-              if "signingConfig" in block:
-                  block = re.sub(
-                      r"signingConfig\s*=\s*[^\n]+",
-                      'signingConfig = signingConfigs.getByName("debug")',
-                      block,
-                  )
-              else:
-                  block = block.replace("{", '{\n            signingConfig = signingConfigs.getByName("debug")', 1)
-              return block
-          text2 = re.sub(r"release\s*\{[^}]*\}", fix_release, text, count=1, flags=re.DOTALL)
-          p.write_text(text2)
-          print("Patched Kotlin release signingConfig -> debug")
-          PY
-          else
-            echo "WARNING: could not find app/build.gradle(.kts) to patch signing"
-            ls -la app/ || true
+          ENTRY=$(node -e "const p=require('./package.json'); console.log(p.main || 'node_modules/expo/AppEntry.js')")
+          echo "Entry file: $ENTRY"
+
+          # Prefer expo export pipeline when available; fall back to react-native CLI bundle
+          if npx expo export --help 2>&1 | grep -q -- '--platform'; then
+            echo "Trying expo export for android assets..."
+            # Still use classic bundle for assets path that RN debug loads
+            true
           fi
 
-      - name: Build RELEASE APK (embeds JS bundle — no Metro needed)
+          npx react-native bundle \
+            --platform android \
+            --dev false \
+            --minify true \
+            --entry-file "$ENTRY" \
+            --bundle-output android/app/src/main/assets/index.android.bundle \
+            --assets-dest android/app/src/main/res \
+            --reset-cache
+
+          ls -la android/app/src/main/assets/
+          # Sanity: bundle must not be empty
+          test -s android/app/src/main/assets/index.android.bundle
+
+      - name: Build debug APK (with embedded bundle)
         working-directory: ${{ env.PROJECT_DIR }}/android
         run: |
           set -e
           chmod +x gradlew
-          # Release packages index.android.bundle into the APK
-          ./gradlew assembleRelease --stacktrace --no-daemon
-          echo "== APK search =="
-          find . -name "*.apk" -type f
+          ./gradlew assembleDebug --stacktrace --no-daemon 2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
+          echo "== APK files =="
+          find . -name "*.apk" -type f -print
 
-      - name: Upload standalone APK
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: gram-panchayat-cashbook-standalone-apk
           path: |
-            ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/release/*.apk
+            ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/debug/*.apk
             ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/**/*.apk
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload logs on failure
+      - name: Upload gradle log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: expo-build-logs
+          name: gradle-build-log
           path: |
+            ${{ github.workspace }}/gradle-build.log
             ${{ env.PROJECT_DIR }}/android/**/build/reports/**
-            ${{ env.PROJECT_DIR }}/android/**/build/outputs/**
           retention-days: 7
           if-no-files-found: ignore
           
