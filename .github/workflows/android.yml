@@ -1,8 +1,7 @@
 name: Build Expo Standalone APK
 
 # Expo / React Native ZIP at repo root → standalone APK (JS embedded, no Metro).
-# Uses assembleRelease so the React Native Gradle plugin bundles JS automatically.
-# Signed with a generated debug keystore (sideload OK; not for Play Store).
+# assembleRelease → RN Gradle plugin embeds JS. Signed with generated debug keystore.
 
 on:
   push:
@@ -63,10 +62,10 @@ jobs:
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           ls -la "$PROJECT_DIR"
 
-      - name: Set up Node.js 20
+      - name: Set up Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Enable corepack / pnpm
         run: |
@@ -171,7 +170,6 @@ jobs:
         working-directory: ${{ env.PROJECT_DIR }}/android
         run: |
           set -e
-          # Sideload-only keystore (NOT for Play Store)
           keytool -genkeypair -v \
             -storetype PKCS12 \
             -keystore debug-release.keystore \
@@ -184,13 +182,13 @@ jobs:
             -dname "CN=Android Debug,O=Android,C=US"
           ls -la debug-release.keystore
 
-      - name: Build RELEASE APK (Gradle embeds JS bundle automatically)
+      - name: Build RELEASE APK
         working-directory: ${{ env.PROJECT_DIR }}/android
         run: |
-          set -e
+          # pipefail: if gradlew fails, the step fails (tee alone always exits 0)
+          set -eo pipefail
           chmod +x gradlew
 
-          # Injected signing avoids editing build.gradle and works with AGP
           ./gradlew assembleRelease \
             -Pandroid.injected.signing.store.file="$(pwd)/debug-release.keystore" \
             -Pandroid.injected.signing.store.password=android \
@@ -199,16 +197,38 @@ jobs:
             --stacktrace --no-daemon \
             2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
 
-          echo "== APK files =="
-          find . -name "*.apk" -type f -print
+          echo "== All APK files under android/ =="
+          find . -name "*.apk" -type f -print || true
+
+      - name: Locate APK and copy to known path
+        working-directory: ${{ env.PROJECT_DIR }}/android
+        run: |
+          set -e
+          mkdir -p "$GITHUB_WORKSPACE/apk-out"
+
+          # Prefer signed release, then any release, then any apk
+          APK=$(find . -path "*/outputs/apk/*" -name "*.apk" -type f | grep -E 'release' | head -n 1 || true)
+          if [ -z "$APK" ]; then
+            APK=$(find . -name "*.apk" -type f | head -n 1 || true)
+          fi
+
+          if [ -z "$APK" ]; then
+            echo "ERROR: No APK produced. Last 80 lines of gradle log:"
+            tail -n 80 "$GITHUB_WORKSPACE/gradle-build.log" || true
+            echo "---- tree outputs ----"
+            find . -path "*/build/outputs/*" -type f | head -80 || true
+            exit 1
+          fi
+
+          echo "Found APK: $APK"
+          cp -v "$APK" "$GITHUB_WORKSPACE/apk-out/gram-panchayat-cashbook.apk"
+          ls -la "$GITHUB_WORKSPACE/apk-out/"
 
       - name: Upload standalone APK
         uses: actions/upload-artifact@v4
         with:
           name: gram-panchayat-cashbook-standalone-apk
-          path: |
-            ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/release/*.apk
-            ${{ env.PROJECT_DIR }}/android/app/build/outputs/apk/**/*-release*.apk
+          path: apk-out/*.apk
           if-no-files-found: error
           retention-days: 14
 
@@ -220,6 +240,7 @@ jobs:
           path: |
             ${{ github.workspace }}/gradle-build.log
             ${{ env.PROJECT_DIR }}/android/**/build/reports/**
+            ${{ env.PROJECT_DIR }}/android/**/build/outputs/**
           retention-days: 7
           if-no-files-found: ignore
           
