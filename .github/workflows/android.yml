@@ -1,7 +1,8 @@
 name: Build Expo Debug APK
 
 # Source ZIP: Gram-Panchayat-Cashbook-Android-MVP.zip (Expo / React Native)
-# Flow: extract → sanitize package.json → pnpm install → expo prebuild → gradle assembleDebug
+# Flow: extract → sanitize package.json → pnpm install → expo prebuild --no-install
+#       → re-install if needed → gradle assembleDebug
 
 on:
   push:
@@ -16,6 +17,8 @@ jobs:
     env:
       ANDROID_HOME: ${{ github.workspace }}/android-sdk
       ANDROID_SDK_ROOT: ${{ github.workspace }}/android-sdk
+      CI: '1'
+      EXPO_NO_TELEMETRY: '1'
 
     steps:
       - name: Checkout repository
@@ -124,14 +127,11 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      # Avoid android-actions/setup-android — it tries to install obsolete package "tools"
-      # and fails on current cmdline-tools. Install SDK components manually instead.
       - name: Install Android command-line tools + SDK packages
         run: |
           set -e
           mkdir -p "$ANDROID_HOME/cmdline-tools"
           cd /tmp
-          # Official commandlinetools (no obsolete "tools" package)
           curl -fsSL -o cmdline-tools.zip \
             https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
           unzip -q cmdline-tools.zip
@@ -140,7 +140,6 @@ jobs:
           mv cmdline-tools/* "$ANDROID_HOME/cmdline-tools/latest/"
           rm -rf cmdline-tools cmdline-tools.zip
 
-          echo "ANDROID_HOME=$ANDROID_HOME"
           export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$PATH"
 
           yes | sdkmanager --licenses >/dev/null || true
@@ -156,20 +155,48 @@ jobs:
 
           sdkmanager --list_installed | head -30
 
-      - name: Expo prebuild (generate android/ native project)
+      - name: Expo prebuild (generate android/ — no interactive install)
         working-directory: ${{ env.PROJECT_DIR }}
-        env:
-          CI: 'true'
-          EXPO_NO_TELEMETRY: '1'
         run: |
           set -e
-          npx expo prebuild --platform android --non-interactive --clean
+          # --no-install: do not prompt to install updated deps after rewriting package.json
+          # CI=1 already set in job env
+          npx expo prebuild --platform android --clean --no-install
           ls -la android
+
+      - name: Re-install deps after prebuild (package.json may have changed)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -e
+          # Strip monorepo markers again if prebuild rewrote package.json
+          node <<'NODE'
+          const fs = require('fs');
+          const pkgPath = 'package.json';
+          if (!fs.existsSync(pkgPath)) process.exit(0);
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+          const strip = (deps) => {
+            if (!deps) return deps;
+            const out = {};
+            for (const [name, ver] of Object.entries(deps)) {
+              if (typeof ver !== 'string') continue;
+              if (ver.startsWith('workspace:') || ver.startsWith('catalog:')) continue;
+              out[name] = ver;
+            }
+            return out;
+          };
+          pkg.dependencies = strip(pkg.dependencies);
+          pkg.devDependencies = strip(pkg.devDependencies);
+          fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+          NODE
+
+          if [ -f pnpm-lock.yaml ]; then
+            pnpm install --no-frozen-lockfile || npm install
+          else
+            pnpm install || npm install
+          fi
 
       - name: Build debug APK with Gradle
         working-directory: ${{ env.PROJECT_DIR }}/android
-        env:
-          CI: 'true'
         run: |
           set -e
           chmod +x gradlew
