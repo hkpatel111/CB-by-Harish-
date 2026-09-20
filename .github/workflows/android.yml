@@ -171,11 +171,47 @@ jobs:
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
 
+      - name: Ensure babel.config.js + disable New Architecture
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -e
+          cat > babel.config.js << 'BABEL'
+          module.exports = function (api) {
+            api.cache(true);
+            return {
+              presets: ['babel-preset-expo'],
+              plugins: ['react-native-reanimated/plugin'],
+            };
+          };
+          BABEL
+          # strip leading spaces from heredoc body if any
+          node -e "const fs=require('fs'); let s=fs.readFileSync('babel.config.js','utf8'); s=s.split('
+').map(l=>l.replace(/^          /,'')).join('
+'); fs.writeFileSync('babel.config.js',s);"
+          node <<'NODE'
+          const fs = require('fs');
+          const app = JSON.parse(fs.readFileSync('app.json', 'utf8'));
+          app.expo = app.expo || {};
+          app.expo.newArchEnabled = false;
+          app.expo.android = Object.assign({}, app.expo.android, { package: 'com.grampanchayat.cashbook' });
+          fs.writeFileSync('app.json', JSON.stringify(app, null, 2) + '
+');
+          console.log('newArchEnabled=false package=', app.expo.android.package);
+          NODE
+          pnpm add -D babel-preset-expo || npm install -D babel-preset-expo
+          cat babel.config.js
+
       - name: Expo prebuild (android)
+
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
           npx expo prebuild --platform android --clean --no-install
+          # Double-check gradle new arch off
+          if [ -f android/gradle.properties ]; then
+            sed -i 's/newArchEnabled=true/newArchEnabled=false/g' android/gradle.properties || true
+            grep -i newArch android/gradle.properties || true
+          fi
           ls -la android
 
       - name: Re-install after prebuild
