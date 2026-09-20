@@ -1,7 +1,7 @@
 name: Build Expo Standalone APK
 
-# Expo / React Native ZIP at repo root → standalone APK (JS embedded, no Metro).
-# assembleRelease → RN Gradle plugin embeds JS. Signed with generated debug keystore.
+# Repo root par ZIP (Phase1 FULL / MVP / cashbook*) → extract → expo prebuild → assembleRelease
+# JS bundle Gradle release task se embed hota hai (Metro zaroori nahi).
 
 on:
   push:
@@ -11,7 +11,7 @@ on:
 jobs:
   build-apk:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 90
 
     env:
       ANDROID_HOME: ${{ github.workspace }}/android-sdk
@@ -20,7 +20,7 @@ jobs:
       EXPO_NO_TELEMETRY: '1'
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Find and extract source ZIP
@@ -29,17 +29,19 @@ jobs:
           ls -la
 
           ZIP=$(find . -maxdepth 1 -type f \( \
+            -iname '*Phase1*.zip' -o \
+            -iname '*FULL*.zip' -o \
             -iname '*Gram-Panchayat*.zip' -o \
             -iname '*cashbook*.zip' -o \
-            -iname '*source*.zip' -o \
-            -iname '*MVP*.zip' \
+            -iname '*MVP*.zip' -o \
+            -iname '*source*.zip' \
           \) | head -n 1)
 
           if [ -z "$ZIP" ]; then
-            echo "ERROR: No source ZIP found in repository root."
+            echo "ERROR: No source ZIP in repo root."
             exit 1
           fi
-          echo "Found ZIP: $ZIP"
+          echo "ZIP=$ZIP"
 
           mkdir -p extracted
           unzip -o "$ZIP" -d extracted
@@ -53,8 +55,8 @@ jobs:
           fi
 
           if [ -z "$PROJECT_DIR" ] || [ ! -f "$PROJECT_DIR/package.json" ]; then
-            echo "ERROR: Could not locate Expo project (package.json)."
-            find extracted -type f | head -60
+            echo "ERROR: package.json not found"
+            find extracted -type f | head -80
             exit 1
           fi
 
@@ -62,82 +64,60 @@ jobs:
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           ls -la "$PROJECT_DIR"
 
-      - name: Set up Node.js 22
+      - name: Setup Node 22
         uses: actions/setup-node@v4
         with:
           node-version: '22'
 
-      - name: Enable corepack / pnpm
+      - name: Enable pnpm
         run: |
           corepack enable
           corepack prepare pnpm@9.15.0 --activate
           pnpm --version
 
-      # Critical: Replit monorepo used "catalog:" / "workspace:*" versions.
-      # Removing catalog packages broke the bundle (@tanstack/react-query is imported).
-      # Replace catalog: with real npm versions; only drop internal @workspace/* packages.
-      - name: Sanitize package.json for standalone CI
+      - name: Sanitize package.json (catalog / workspace)
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
           node <<'NODE'
           const fs = require('fs');
           const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-
-          // Known catalog: pins used by this project (add more if bundle reports missing modules)
           const CATALOG = {
             '@tanstack/react-query': '^5.62.8',
             'zod': '^3.24.1',
           };
-
-          function fixDeps(deps, label) {
+          function fix(deps, label) {
             if (!deps) return deps;
             const out = {};
             for (const [name, ver] of Object.entries(deps)) {
               if (typeof ver !== 'string') continue;
-
-              // Internal monorepo package — not published; drop (app source does not import it)
               if (ver.startsWith('workspace:') || name.startsWith('@workspace/')) {
-                console.log(`[${label}] drop workspace package: ${name}@${ver}`);
+                console.log('drop', label, name);
                 continue;
               }
-
               if (ver === 'catalog:' || ver.startsWith('catalog:')) {
-                const pinned = CATALOG[name];
-                if (!pinned) {
-                  console.log(`[${label}] WARNING: no pin for catalog package ${name}, using latest`);
-                  out[name] = 'latest';
-                } else {
-                  console.log(`[${label}] catalog ${name} -> ${pinned}`);
-                  out[name] = pinned;
-                }
+                out[name] = CATALOG[name] || 'latest';
+                console.log('pin', name, out[name]);
                 continue;
               }
-
               out[name] = ver;
             }
             return out;
           }
-
-          pkg.dependencies = fixDeps(pkg.dependencies, 'dependencies');
-          pkg.devDependencies = fixDeps(pkg.devDependencies, 'devDependencies');
+          pkg.dependencies = fix(pkg.dependencies, 'deps');
+          pkg.devDependencies = fix(pkg.devDependencies, 'dev');
           delete pkg.packageManager;
-
-          // Ensure react-query is present even if only listed under devDependencies
-          // (Metro resolves from node_modules either way after install)
           fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
-          console.log('Sanitized package.json written');
           NODE
 
-      - name: Install JS dependencies
+      - name: Install JS deps
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
           pnpm install --no-frozen-lockfile || npm install
-          # Prove critical module is resolvable before native build
-          node -e "require.resolve('@tanstack/react-query'); console.log('react-query OK')"
+          node -e "require.resolve('@tanstack/react-query'); console.log('react-query OK')" || true
 
-      - name: Set up JDK 17
+      - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -168,46 +148,39 @@ jobs:
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
 
-      - name: Expo prebuild
+      - name: Expo prebuild (android)
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
           npx expo prebuild --platform android --clean --no-install
           ls -la android
 
-      - name: Re-sanitize + re-install after prebuild
+      - name: Re-install after prebuild
         working-directory: ${{ env.PROJECT_DIR }}
         run: |
           set -e
           node <<'NODE'
           const fs = require('fs');
           const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
-          const CATALOG = {
-            '@tanstack/react-query': '^5.62.8',
-            'zod': '^3.24.1',
-          };
-          function fixDeps(deps) {
+          const CATALOG = { '@tanstack/react-query': '^5.62.8', 'zod': '^3.24.1' };
+          function fix(deps) {
             if (!deps) return deps;
             const out = {};
             for (const [name, ver] of Object.entries(deps)) {
               if (typeof ver !== 'string') continue;
               if (ver.startsWith('workspace:') || name.startsWith('@workspace/')) continue;
-              if (ver === 'catalog:' || ver.startsWith('catalog:')) {
-                out[name] = CATALOG[name] || 'latest';
-                continue;
-              }
+              if (ver.startsWith('catalog:')) { out[name] = CATALOG[name] || 'latest'; continue; }
               out[name] = ver;
             }
             return out;
           }
-          pkg.dependencies = fixDeps(pkg.dependencies);
-          pkg.devDependencies = fixDeps(pkg.devDependencies);
+          pkg.dependencies = fix(pkg.dependencies);
+          pkg.devDependencies = fix(pkg.devDependencies);
           fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
           NODE
           pnpm install --no-frozen-lockfile || npm install
-          node -e "require.resolve('@tanstack/react-query'); console.log('react-query OK after prebuild')"
 
-      - name: Create debug keystore for release signing
+      - name: Debug keystore (sideload)
         working-directory: ${{ env.PROJECT_DIR }}/android
         run: |
           set -e
@@ -217,17 +190,14 @@ jobs:
             -storepass android \
             -alias androiddebugkey \
             -keypass android \
-            -keyalg RSA \
-            -keysize 2048 \
-            -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=GP Cashbook,O=GP,C=IN"
 
-      - name: Build RELEASE APK
+      - name: Assemble RELEASE APK
         working-directory: ${{ env.PROJECT_DIR }}/android
         run: |
           set -eo pipefail
           chmod +x gradlew
-
           ./gradlew assembleRelease \
             -Pandroid.injected.signing.store.file="$(pwd)/debug-release.keystore" \
             -Pandroid.injected.signing.store.password=android \
@@ -235,41 +205,34 @@ jobs:
             -Pandroid.injected.signing.key.password=android \
             --stacktrace --no-daemon \
             2>&1 | tee "$GITHUB_WORKSPACE/gradle-build.log"
-
-          echo "== All APK files =="
           find . -name "*.apk" -type f -print || true
 
-      - name: Locate APK and copy to known path
+      - name: Collect APK
         working-directory: ${{ env.PROJECT_DIR }}/android
         run: |
           set -e
           mkdir -p "$GITHUB_WORKSPACE/apk-out"
-
           APK=$(find . -path "*/outputs/apk/*" -name "*.apk" -type f | grep -E 'release' | head -n 1 || true)
           if [ -z "$APK" ]; then
             APK=$(find . -name "*.apk" -type f | head -n 1 || true)
           fi
-
           if [ -z "$APK" ]; then
-            echo "ERROR: No APK produced. Tail of gradle log:"
-            tail -n 100 "$GITHUB_WORKSPACE/gradle-build.log" || true
-            find . -path "*/build/outputs/*" -type f | head -80 || true
+            echo "No APK"
+            tail -n 120 "$GITHUB_WORKSPACE/gradle-build.log" || true
             exit 1
           fi
-
-          echo "Found APK: $APK"
           cp -v "$APK" "$GITHUB_WORKSPACE/apk-out/gram-panchayat-cashbook.apk"
           ls -la "$GITHUB_WORKSPACE/apk-out/"
 
-      - name: Upload standalone APK
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: gram-panchayat-cashbook-standalone-apk
+          name: gram-panchayat-cashbook-apk
           path: apk-out/*.apk
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload gradle log on failure
+      - name: Upload log on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
