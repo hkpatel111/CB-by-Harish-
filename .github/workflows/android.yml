@@ -106,6 +106,29 @@ jobs:
           }
           pkg.dependencies = fix(pkg.dependencies, 'deps');
           pkg.devDependencies = fix(pkg.devDependencies, 'dev');
+          // SDK 57 incompatible pins we once added — app uses RN Share + AsyncStorage only
+          const REMOVE = new Set([
+            'expo-document-picker',
+            'expo-file-system',
+            'expo-sharing',
+          ]);
+          for (const bag of ['dependencies', 'devDependencies']) {
+            if (!pkg[bag]) continue;
+            for (const name of REMOVE) {
+              if (pkg[bag][name]) {
+                console.log('remove incompatible', name, pkg[bag][name]);
+                delete pkg[bag][name];
+              }
+            }
+          }
+          // Align local-authentication with expo 57 if present with ancient pin
+          for (const bag of ['dependencies', 'devDependencies']) {
+            if (pkg[bag] && pkg[bag]['expo-local-authentication']) {
+              // let expo prebuild resolve; use loose range compatible with SDK 57
+              pkg[bag]['expo-local-authentication'] = '~16.0.0';
+              console.log('pin expo-local-authentication ~16.0.0');
+            }
+          }
           delete pkg.packageManager;
           fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
           NODE
@@ -176,6 +199,13 @@ jobs:
           }
           pkg.dependencies = fix(pkg.dependencies);
           pkg.devDependencies = fix(pkg.devDependencies);
+          for (const bag of ['dependencies', 'devDependencies']) {
+            if (!pkg[bag]) continue;
+            delete pkg[bag]['expo-document-picker'];
+            delete pkg[bag]['expo-file-system'];
+            delete pkg[bag]['expo-sharing'];
+            if (pkg[bag]['expo-local-authentication']) pkg[bag]['expo-local-authentication'] = '~16.0.0';
+          }
           fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
           NODE
           pnpm install --no-frozen-lockfile || npm install
