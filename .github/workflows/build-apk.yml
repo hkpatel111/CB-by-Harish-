@@ -59,27 +59,26 @@ jobs:
         working-directory: extracted/cashbook-mobile
         run: npm run typecheck
 
-      # Managed workflow hai (android/ folder zip me nahi) — prebuild se Gradle project banta hai
+      # Managed workflow hai (android/ folder zip me nahi) — prebuild se Gradle project banta hai.
+      # NOTE: `-y` mat likhna — SDK 57 prebuild ko koi aisa flag nahi hai
+      #       ("unknown or unexpected option: -y"). Default hi non-interactive recreate karta hai.
       - name: Generate android project (expo prebuild)
         working-directory: extracted/cashbook-mobile
         env:
           CI: "1"
           EXPO_NO_TELEMETRY: "1"
-        run: npx expo prebuild --platform android --no-install -y
+        run: npx expo prebuild --platform android --no-install
 
       # Java/gradle cache prebuild ke BAAD — tabhi android/ gradle files exist karti hain.
-      # (Pehle checkout ke waqt rakhne par setup-java cache path dhoondh kar fail ho jata:
-      #  "No file matched to **/*.gradle*")
+      # (Checkout ke waqt rakhne par setup-java ko koi gradle file nahi mili thi aur wo
+      #  "No file matched to **/*.gradle*" se fail ho gaya tha.)
+      # cache-dependency-path ki zaroorat nahi — default globs ab android/ me match ho jaate hain.
       - name: Setup Java 17 (Gradle)
         uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
           cache: gradle
-          cache-dependency-path: |
-            extracted/cashbook-mobile/android/**/gradle-wrapper.properties
-            extracted/cashbook-mobile/android/**/*.gradle
-            extracted/cashbook-mobile/android/**/*.gradle.kts
 
       - name: Build release APK
         working-directory: extracted/cashbook-mobile/android
