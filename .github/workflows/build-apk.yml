@@ -1,6 +1,8 @@
-name: Build APK
+name: Build APK (Gram Panchayat Cashbook v7)
 
-# Manual run se APK banega; tag push (v*) par bhi auto.
+# Chalane ka tarika:
+#   GitHub → Actions → "Build APK (Gram Panchayat Cashbook v7)" → Run workflow
+# ya tag push karo: git tag v7 && git push origin v7
 on:
   workflow_dispatch:
   push:
@@ -19,10 +21,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # unzip warning (exit 1) par bhi ruk na jaye — sirf asli error (code > 1) fail kare
+      # Zip ke andar poori project hoti hai (app/, context/, types/, services/,
+      # package.json, package-lock.json, configs). node_modules kabhi zip me nahi.
       - name: Extract source zip
         run: |
-          ZIP=./Gram-Panchayat-Cashbook-FULL-v6.zip
+          ZIP=./Gram-Panchayat-Cashbook-FULL-v7.zip
+          if [ ! -f "$ZIP" ]; then
+            echo "ERROR: $ZIP not found. Repo root par rakha ho:"
+            ls -la
+            exit 1
+          fi
+          # unzip warning (exit 1) par bhi ruk na jaye — sirf asli error (code > 1) fail kare
           set +e
           unzip -q -o "$ZIP" -d extracted
           code=$?
@@ -31,6 +40,7 @@ jobs:
             echo "unzip failed with code $code"
             exit "$code"
           fi
+          echo "Contents:"
           ls -la extracted/cashbook-mobile
 
       - name: Setup Node 20
@@ -51,11 +61,12 @@ jobs:
         working-directory: extracted/cashbook-mobile
         run: npm ci --no-audit --no-fund
 
+      # Typecheck fail-fast — galat code par Gradle me time waste nahi
       - name: Typecheck (fail fast)
         working-directory: extracted/cashbook-mobile
         run: npm run typecheck
 
-      # Managed workflow hai (android/ folder nahi) — prebuild se Gradle project generate hota hai
+      # Managed workflow hai (android/ folder zip me nahi) — prebuild se Gradle project banta hai
       - name: Generate android project (expo prebuild)
         working-directory: extracted/cashbook-mobile
         env:
