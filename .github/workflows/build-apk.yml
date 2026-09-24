@@ -1,0 +1,82 @@
+name: Build APK
+
+# Manual run se APK banega; tag push (v*) par bhi auto.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # unzip warning (exit 1) par bhi ruk na jaye — sirf asli error (code > 1) fail kare
+      - name: Extract source zip
+        run: |
+          ZIP=./Gram-Panchayat-Cashbook-FULL-v6.zip
+          set +e
+          unzip -q -o "$ZIP" -d extracted
+          code=$?
+          set -e
+          if [ "$code" -gt 1 ]; then
+            echo "unzip failed with code $code"
+            exit "$code"
+          fi
+          ls -la extracted/cashbook-mobile
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: extracted/cashbook-mobile/package-lock.json
+
+      - name: Setup Java 17 (Gradle)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Install JS dependencies
+        working-directory: extracted/cashbook-mobile
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck (fail fast)
+        working-directory: extracted/cashbook-mobile
+        run: npm run typecheck
+
+      # Managed workflow hai (android/ folder nahi) — prebuild se Gradle project generate hota hai
+      - name: Generate android project (expo prebuild)
+        working-directory: extracted/cashbook-mobile
+        env:
+          CI: "1"
+          EXPO_NO_TELEMETRY: "1"
+        run: npx expo prebuild --platform android --no-install -y
+
+      - name: Build release APK
+        working-directory: extracted/cashbook-mobile/android
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Collect APK
+        run: |
+          mkdir -p out
+          cp extracted/cashbook-mobile/android/app/build/outputs/apk/release/*.apk out/GramPanchayatCashbook.apk
+          ls -lh out/
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GramPanchayatCashbook-APK
+          path: out/GramPanchayatCashbook.apk
+          if-no-files-found: error
+          retention-days: 30
