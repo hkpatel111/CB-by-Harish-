@@ -19,7 +19,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Zip ke andar poori project hoti hai (app/, context/, types/, services/,
       # package.json, package-lock.json, configs). node_modules kabhi zip me nahi.
@@ -44,18 +44,11 @@ jobs:
           ls -la extracted/cashbook-mobile
 
       - name: Setup Node 20
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 20
           cache: npm
           cache-dependency-path: extracted/cashbook-mobile/package-lock.json
-
-      - name: Setup Java 17 (Gradle)
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-          cache: gradle
 
       - name: Install JS dependencies
         working-directory: extracted/cashbook-mobile
@@ -74,6 +67,20 @@ jobs:
           EXPO_NO_TELEMETRY: "1"
         run: npx expo prebuild --platform android --no-install -y
 
+      # Java/gradle cache prebuild ke BAAD — tabhi android/ gradle files exist karti hain.
+      # (Pehle checkout ke waqt rakhne par setup-java cache path dhoondh kar fail ho jata:
+      #  "No file matched to **/*.gradle*")
+      - name: Setup Java 17 (Gradle)
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+          cache-dependency-path: |
+            extracted/cashbook-mobile/android/**/gradle-wrapper.properties
+            extracted/cashbook-mobile/android/**/*.gradle
+            extracted/cashbook-mobile/android/**/*.gradle.kts
+
       - name: Build release APK
         working-directory: extracted/cashbook-mobile/android
         run: ./gradlew assembleRelease --no-daemon --stacktrace
@@ -85,7 +92,7 @@ jobs:
           ls -lh out/
 
       - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: GramPanchayatCashbook-APK
           path: out/GramPanchayatCashbook.apk
