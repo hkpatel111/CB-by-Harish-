@@ -25,12 +25,15 @@ jobs:
       # package.json, package-lock.json, configs). node_modules kabhi zip me nahi.
       - name: Extract source zip
         run: |
-          ZIP=./Gram-Panchayat-Cashbook-FULL-v10.zip
-          if [ ! -f "$ZIP" ]; then
-            echo "ERROR: $ZIP not found. Repo root par rakha ho:"
+          # v11 se: naam hardcode nahi — root par pada koi bhi FULL zip apne aap chun liya jaye
+          # (agla round sirf nayi zip daalo, workflow badalne ki zaroorat nahi)
+          ZIP=$(ls Gram-Panchayat-Cashbook-FULL-*.zip 2>/dev/null | sort -V | tail -n 1)
+          if [ -z "$ZIP" ] || [ ! -f "$ZIP" ]; then
+            echo "ERROR: Gram-Panchayat-Cashbook-FULL-*.zip not found. Repo root par rakha ho:"
             ls -la
             exit 1
           fi
+          echo "Using source zip: $ZIP"
           # unzip warning (exit 1) par bhi ruk na jaye — sirf asli error (code > 1) fail kare
           set +e
           unzip -q -o "$ZIP" -d extracted
