@@ -1,8 +1,8 @@
-name: Build APK (Gram Panchayat Cashbook v11)
+name: Build APK (Gram Panchayat Cashbook v12)
 
 # Chalane ka tarika:
-#   GitHub → Actions → "Build APK (Gram Panchayat Cashbook v11)" → Run workflow
-# ya tag push karo: git tag v11 && git push origin v11
+#   GitHub → Actions → "Build APK (Gram Panchayat Cashbook v12)" → Run workflow
+# ya tag push karo: git tag v12 && git push origin v12
 on:
   workflow_dispatch:
   push:
